@@ -20,6 +20,10 @@ class GraphData(NamedTuple):
     cell_offsets: Tensor = None
     displacement: Optional[Tensor] = None
     pbc: Optional[Tensor] = None
+    # Static-shape mode (CUDA-graph friendly): edge_index keeps every cached
+    # edge (cutoff+skin) and edge_mask[e] = 1.0 iff 0 < dist <= cutoff.
+    # None means edges were hard-filtered as before.
+    edge_mask: Optional[Tensor] = None
 
 
 @dataclass
@@ -175,7 +179,8 @@ def _update_edge_geometry(
     cell_offsets: Tensor,
     precision: torch.dtype = torch.float32,
     cutoff: Optional[float] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    static_shapes: bool = False,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
     row = edge_index[0]
     col = edge_index[1]
     edge_batch = batch[col]
@@ -191,11 +196,18 @@ def _update_edge_geometry(
     valid_mask = distances > 0
     if cutoff is not None:
         valid_mask = torch.logical_and(valid_mask, distances <= cutoff)
+    if static_shapes:
+        # Keep every cached edge so tensor shapes stay constant within a
+        # topology window (CUDA-graph capturable); validity is expressed as a
+        # multiplicative mask instead of index filtering. Mathematically
+        # equivalent: out-of-cutoff edge contributions are zeroed in the model.
+        edge_mask = valid_mask.to(precision).unsqueeze(-1)
+        return edge_index, cell_offsets, distances, distance_vectors, edge_mask
     edge_index = edge_index[:, valid_mask]
     cell_offsets = cell_offsets[valid_mask]
     distances = distances[valid_mask]
     distance_vectors = distance_vectors[valid_mask]
-    return edge_index, cell_offsets, distances, distance_vectors
+    return edge_index, cell_offsets, distances, distance_vectors, None
 
 
 def graph_from_neighbor_topology(
@@ -208,12 +220,25 @@ def graph_from_neighbor_topology(
     displacement: Optional[Tensor] = None,
     cutoff: Optional[float] = None,
     dtype: torch.dtype = torch.float32,
+    compute_stress: bool = False,
+    static_shapes: bool = False,
 ) -> GraphData:
     precision = dtype
     pos = pos.to(precision)
     z = z.long()
     cell = check_and_reshape_cell(cell)
-    edge_index, cell_offsets, dist, vecs = _update_edge_geometry(
+    if compute_stress and displacement is None:
+        # Inject the symmetric-displacement trick on top of the cached
+        # topology: the displacement tensor is numerically zero, so positions,
+        # cell and hence the cached neighbor list are unchanged; the edge
+        # geometry below is recomputed from the displaced pos/cell and is
+        # therefore differentiable w.r.t. the displacement (stress via
+        # autograd), exactly as in process_positions_and_edges.
+        pos, cell, displacement = get_symmetric_displacement(
+            pos, cell, num_graphs=int(natoms.numel()), batch=batch
+        )
+        cell = check_and_reshape_cell(cell)
+    edge_index, cell_offsets, dist, vecs, edge_mask = _update_edge_geometry(
         pos=pos,
         batch=batch,
         edge_index=topology.edge_index,
@@ -221,6 +246,7 @@ def graph_from_neighbor_topology(
         cell_offsets=topology.cell_offsets,
         precision=precision,
         cutoff=topology.cutoff if cutoff is None else cutoff,
+        static_shapes=static_shapes,
     )
     return GraphData(
         pos=pos,
@@ -233,6 +259,7 @@ def graph_from_neighbor_topology(
         cell=cell,
         cell_offsets=cell_offsets,
         displacement=displacement,
+        edge_mask=edge_mask,
     )
 
 

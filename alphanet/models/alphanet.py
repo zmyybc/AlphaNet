@@ -10,6 +10,13 @@ from torch_geometric.nn.conv import MessagePassing
 from alphanet.models.graph import GraphData
 import numpy as np
 
+try:  # fused Triton ops (phase 3); reference path remains the fallback
+    from alphanet import ops as _fused_ops
+    if not _fused_ops.is_available():
+        _fused_ops = None
+except Exception:
+    _fused_ops = None
+
 
 def scatter(src: torch.Tensor, index: torch.Tensor, dim: int = -1, 
             out: Optional[torch.Tensor] = None, dim_size: Optional[int] = None, 
@@ -127,7 +134,8 @@ class S_vector(MessagePassing):
 
 class EquiMessagePassing(MessagePassing):
     propagate_type = {
-        'xh': Tensor, 'vec': Tensor, 'rbfh_ij': Tensor, 'r_ij': Tensor
+        'xh': Tensor, 'vec': Tensor, 'rbfh_ij': Tensor, 'r_ij': Tensor,
+        'edge_mask': Optional[Tensor]
     }
 
     def __init__(
@@ -228,27 +236,41 @@ class EquiMessagePassing(MessagePassing):
         edge_rbf: Tensor,
         weight: Tensor,
         edge_vector: Tensor,
-        rope: Optional[Tensor] = None
+        rope: Optional[Tensor] = None,
+        edge_mask: Optional[Tensor] = None
     ) -> Tuple[Tensor, Tensor, Tensor]:
         if rope is not None:
-            real, imag = torch.split(x, [self.hidden_channels // 2, self.hidden_channels // 2], dim=-1)
-            dy_pre = torch.complex(real=real, imag=imag)
-            dy_pre = dy_pre * rope
-            x = torch.cat([dy_pre.real, dy_pre.imag], dim=-1)
+            # rope is a real tensor [N, hidden_channels]: first half cos(dx),
+            # second half sin(dx). Complex rotation (x_r + i x_i)(c + i s)
+            # carried out in real arithmetic (math-equivalent).
+            rc, rs = torch.split(rope, [self.hidden_channels // 2, self.hidden_channels // 2], dim=-1)
+            xr, xi = torch.split(x, [self.hidden_channels // 2, self.hidden_channels // 2], dim=-1)
+            x = torch.cat([xr * rc - xi * rs, xr * rs + xi * rc], dim=-1)
             
         xh = self.x_proj(self.x_layernorm(x))
         rbfh = self.rbf_proj(edge_rbf)
         weight = self.dir_proj(weight)
         rbfh = rbfh * weight
-        
-        dx, dvec = self.propagate(
-            edge_index,
-            xh=xh,
-            vec=vec,
-            rbfh_ij=rbfh,
-            r_ij=edge_vector,
-            size=None,
-        )
+
+        if (getattr(self, "use_fused_ops", False) and _fused_ops is not None
+                and not self.training and xh.is_cuda
+                and xh.dtype == torch.float32 and self.reduce_mode == "sum"):
+            # Fused message+aggregate (inference): per-edge MPS contraction,
+            # rank-1 dia, fc_mps, atan2 and the vector message all live in
+            # one kernel that accumulates straight into the node outputs —
+            # no [E,3H] gathers or [E,3,H] message tensors are materialized.
+            dx, dvec = _fused_ops.fused_equi_message(
+                self, xh, vec, rbfh, edge_vector, edge_index, edge_mask)
+        else:
+            dx, dvec = self.propagate(
+                edge_index,
+                xh=xh,
+                vec=vec,
+                rbfh_ij=rbfh,
+                r_ij=edge_vector,
+                edge_mask=edge_mask,
+                size=None,
+            )
         
         if self.has_norm_before_flag:
             dx = self.dx_layer_norm(dx)
@@ -259,41 +281,57 @@ class EquiMessagePassing(MessagePassing):
             dx = self.dx_layer_norm(dx)
 
         dx = self.scale2(dx)
-        dx = torch.complex(torch.cos(dx), torch.sin(dx))
-        
+        # next-layer rope as a real tensor [N, hidden_channels]:
+        # equivalent to complex(cos(dx), sin(dx))
+        dx = torch.cat([torch.cos(dx), torch.sin(dx)], dim=-1)
+
         return dx, dy, dvec
 
-    def message(self, xh_j, vec_j, rbfh_ij, r_ij):
+    def message(self, xh_j, vec_j, rbfh_ij, r_ij, edge_mask: Optional[Tensor] = None):
         x, xh2, xh3 = torch.split(xh_j * rbfh_ij, self.hidden_channels, dim=-1)
         xh2 = xh2 * self.inv_sqrt_3
-        
-        real, imagine = torch.split(self.scale(x), self.hidden_channels_chi, dim=-1)
-        real = real.reshape(x.shape[0], self.head, (self.hidden_channels_chi) // self.head)
-        imagine = imagine.reshape(x.shape[0], self.head, (self.hidden_channels_chi) // self.head)
+
+        # MPS contraction in real arithmetic (math-equivalent rewrite).
+        # Original: conv[e,k] = sum_{j,l} cat([ones, phi])[e,j,l] * K[j,l,k]
+        # with K = complex(kernel_real, kernel_imag)/sqrt(H/head) of shape
+        # [head+1, C, chi2]. The ones row (j=0) contributes the constant bias
+        # sum_l K[0,l,k]; the remaining rows form a real/imag GEMM pair over
+        # the flattened (j,l) axis, so no [E, head+1, C, chi2] tensor is built.
+        C = self.hidden_channels_chi // self.head
+        qr, qi = torch.split(self.scale(x), self.hidden_channels_chi, dim=-1)
         if self.has_dropout_flag:
-            real = self.dropout(real)
-            imagine = self.dropout(imagine)
+            qr = self.dropout(qr)
+            qi = self.dropout(qi)
 
-        phi = torch.complex(real, imagine)
-        q = phi
-        a = torch.ones(q.shape[0], 1, (self.hidden_channels_chi) // self.head, device=q.device, dtype=self.complex_type)
-        kernel = (torch.complex(self.kernel_real, self.kernel_imag) / math.sqrt((self.hidden_channels) // self.head)).expand(q.shape[0], -1, -1, -1)
+        norm_factor = math.sqrt(self.hidden_channels // self.head)
+        Kr = (self.kernel_real / norm_factor).reshape(-1, self.chi2)
+        Ki = (self.kernel_imag / norm_factor).reshape(-1, self.chi2)
+        conv_r = torch.matmul(qr, Kr[C:]) - torch.matmul(qi, Ki[C:]) + Kr[:C].sum(0)
+        conv_i = torch.matmul(qr, Ki[C:]) + torch.matmul(qi, Kr[C:]) + Ki[:C].sum(0)
 
-        equation = 'ijl, ijlk->ik'
-        conv = torch.einsum(equation, torch.cat([a, q], dim=1), kernel.to(self.complex_type))
-        a = 1.0 * self.activation(self.diagonal(rbfh_ij))
-        b = a.unsqueeze(-1) * self.diachi1.unsqueeze(0).unsqueeze(0) + torch.ones(kernel.shape[0], self.chi2, self.chi1, device=rbfh_ij.device)
-        dia = self.dia(b)
-        
-        equation = 'ik,ikl->il'
-        kernel = torch.einsum(equation, conv, dia.to(self.complex_type))
-        kernel_real, kernel_imag = kernel.real, kernel.imag
-        kernel_real, kernel_imag = self.fc_mps(kernel_real), self.fc_mps(kernel_imag)
-        kernel = torch.angle(torch.complex(kernel_real, kernel_imag))
-        
+        # dia(b) with b[e,k,l] = a[e,k]*diachi1[l] + 1 has an exact rank-1
+        # form: dia[e,k,m] = a[e,k]*u[m] + v[m], u = W@diachi1, v = W@1 + bias
+        # (u, v are edge-independent), so einsum('ik,ikl->il', conv, dia)
+        # collapses to two per-edge reductions and an outer product.
+        a = self.activation(self.diagonal(rbfh_ij))
+        u = torch.matmul(self.dia.weight, self.diachi1)
+        v = self.dia.weight.sum(1) + self.dia.bias
+        ker_r = (conv_r * a).sum(-1, keepdim=True) * u + conv_r.sum(-1, keepdim=True) * v
+        ker_i = (conv_i * a).sum(-1, keepdim=True) * u + conv_i.sum(-1, keepdim=True) * v
+
+        # angle(complex(fc(re), fc(im))) == atan2(fc(im), fc(re))
+        kernel = torch.atan2(self.fc_mps(ker_i), self.fc_mps(ker_r))
+
         agg = torch.cat([kernel, x], dim=-1)
         vec = vec_j * xh2.unsqueeze(1) + xh3.unsqueeze(1) * r_ij.unsqueeze(2)
         vec = vec * self.inv_sqrt_h
+
+        if edge_mask is not None:
+            # Static-shape mode: rbf_proj/dir_proj/scale/fc_mps carry biases,
+            # so out-of-cutoff edges produce nonzero messages; zero them here
+            # (exactly reproduces the hard edge filtering).
+            agg = agg * edge_mask
+            vec = vec * edge_mask.unsqueeze(-1)
 
         return agg, vec
 
@@ -379,6 +417,11 @@ class AlphaNet(nn.Module):
         self.compute_forces = config.compute_forces
         self.compute_stress = config.compute_stress
         
+        # Inference-only fused Triton kernels (fp32+CUDA). Off by default so
+        # training and TorchScript are untouched; AlphaNetCalculator enables
+        # it when the environment supports it.
+        self.use_fused_ops = False
+
         self.z_emb_ln = nn.LayerNorm(config.hidden_channels, elementwise_affine=False)
         self.z_emb = Embedding(95, config.hidden_channels)
         self.kernel1 = torch.nn.Parameter(torch.randn((config.hidden_channels, self.chi1 * 2), device=self.device))
@@ -478,11 +521,19 @@ class AlphaNet(nn.Module):
         edge_index = data.edge_index
         vecs = data.edge_vec
         
+        edge_mask = data.edge_mask
+
         dist = torch.linalg.norm(vecs, dim=1)
         z_emb = self.z_emb_ln(self.z_emb(z))
         radial_emb = self.radial_emb(dist)
         radial_hidden = self.radial_lin(radial_emb)
         rbounds = 0.5 * (torch.cos(dist * self.pi / self.cutoff) + 1.0)
+        if edge_mask is not None:
+            # Static-shape mode: beyond the cutoff the cosine argument passes
+            # pi and rbounds would go negative; the mask restores the exact
+            # hard-filtered value (zero). NeighborEmb/S_vector messages are
+            # proportional to radial_hidden and therefore vanish automatically.
+            rbounds = rbounds * edge_mask.squeeze(-1)
         radial_hidden = rbounds.unsqueeze(-1) * radial_hidden
 
         s = self.neighbor_emb(z, z_emb, edge_index, radial_hidden)
@@ -493,53 +544,83 @@ class AlphaNet(nn.Module):
         edge_diff = vecs
         edge_diff = edge_diff / (dist.unsqueeze(1) + self.eps)
         
-        edge_vec_mean = scatter(vecs, i, reduce='mean', dim=0) 
+        if edge_mask is not None:
+            # Masked mean over valid edges only — skin edges must not pollute
+            # the local frames. dim_size is passed explicitly so no GPU->CPU
+            # sync happens (CUDA-graph capturable); rows beyond max(i) are
+            # zero and never gathered.
+            vec_sum = scatter(vecs * edge_mask, i, dim=0, dim_size=s.size(0), reduce='sum')
+            vec_cnt = scatter(edge_mask, i, dim=0, dim_size=s.size(0), reduce='sum').clamp(min=1.0)
+            edge_vec_mean = vec_sum / vec_cnt
+        else:
+            edge_vec_mean = scatter(vecs, i, reduce='mean', dim=0)
         edge_cross = torch.cross(vecs, edge_vec_mean[i])
         edge_vertical = torch.cross(edge_diff, edge_cross)
         edge_frame = torch.cat((edge_diff.unsqueeze(-1), edge_cross.unsqueeze(-1), edge_vertical.unsqueeze(-1)), dim=-1)
 
         S_i_j = self.S_vector(s, edge_diff.unsqueeze(-1), edge_index, radial_hidden)
         
-        scalrization1 = torch.sum(S_i_j[i].unsqueeze(2) * edge_frame.unsqueeze(-1), dim=1)
-        scalrization2 = torch.sum(S_i_j[j].unsqueeze(2) * edge_frame.unsqueeze(-1), dim=1)
-        scalrization1[:, 1, :] = torch.square(scalrization1[:, 1, :].clone())
-        scalrization2[:, 1, :] = torch.square(scalrization2[:, 1, :].clone())
-        
-        scalar3 = (self.lin(torch.permute(scalrization1, (0, 2, 1))) + 
-                  torch.permute(scalrization1, (0, 2, 1))[:, :, 0].unsqueeze(2)).squeeze(-1) / math.sqrt(self.hidden_channels)
-        scalar4 = (self.lin(torch.permute(scalrization2, (0, 2, 1))) + 
-                  torch.permute(scalrization2, (0, 2, 1))[:, :, 0].unsqueeze(2)).squeeze(-1) / math.sqrt(self.hidden_channels)
+        if (getattr(self, "use_fused_ops", False) and _fused_ops is not None
+                and not self.training
+                and edge_frame.is_cuda and edge_frame.dtype == torch.float32):
+            # Fused Triton kernel: frame projection + square + 3->H/4->1 MLP
+            # entirely in registers — eliminates the two [E,H,H/4] hidden
+            # blocks (the model's largest allocation) and their autograd
+            # copies. Math-identical to the reference block below.
+            scalar3, scalar4 = _fused_ops.fused_scalarization_mlp(
+                S_i_j, edge_frame, i, j, self.lin, self.hidden_channels)
+        else:
+            # Scalarization via bmm: out[e,f,h] = sum_d edge_frame[e,d,f] * S[e,d,h].
+            # Math-equivalent to the broadcast+sum form but never materializes the
+            # [E,3,3,H] product tensor; the frame-axis-1 square is written without
+            # in-place aliasing (cleaner for autograd).
+            frame_t = edge_frame.transpose(1, 2)
+            scalrization1 = torch.bmm(frame_t, S_i_j[i])
+            scalrization2 = torch.bmm(frame_t, S_i_j[j])
+            s1_0, s1_1, s1_2 = scalrization1.unbind(dim=1)
+            scalrization1 = torch.stack((s1_0, s1_1 * s1_1, s1_2), dim=1)
+            s2_0, s2_1, s2_2 = scalrization2.unbind(dim=1)
+            scalrization2 = torch.stack((s2_0, s2_1 * s2_1, s2_2), dim=1)
+
+            scalar3 = (self.lin(torch.permute(scalrization1, (0, 2, 1))) +
+                      torch.permute(scalrization1, (0, 2, 1))[:, :, 0].unsqueeze(2)).squeeze(-1) / math.sqrt(self.hidden_channels)
+            scalar4 = (self.lin(torch.permute(scalrization2, (0, 2, 1))) +
+                      torch.permute(scalrization2, (0, 2, 1))[:, :, 0].unsqueeze(2)).squeeze(-1) / math.sqrt(self.hidden_channels)
         
         edge_weight = torch.cat((scalar3, scalar4), dim=-1) * rbounds.unsqueeze(-1)
         edge_weight = torch.cat((edge_weight, radial_hidden, radial_emb), dim=-1)
         
-        equation = 'ik,bi->bk'
-        quantum = torch.einsum(equation, self.kernel1, z_emb)
-        real, imagine = torch.split(quantum, self.chi1, dim=-1)
-        quantum = torch.complex(real, imagine)
+        # Quantum state kept as a (q_real, q_imag) pair of real tensors —
+        # math-equivalent to the original complex representation, avoids
+        # complex GEMMs on a real-valued s (whose imaginary part is zero).
+        quantum = torch.matmul(z_emb, self.kernel1)
+        q_real, q_imag = torch.split(quantum, self.chi1, dim=-1)
 
-        rope = None
+        rope: Optional[Tensor] = None
         for id, (message_layer, fte) in enumerate(zip(self.message_layers, self.FTEs)):
-            if rope is None:
-                rope, ds, dvec = message_layer(s, vec, edge_index, radial_emb, edge_weight, edge_diff, None)
-            else:
-                rope, ds, dvec = message_layer(s, vec, edge_index, radial_emb, edge_weight, edge_diff, rope)
-            
+            rope, ds, dvec = message_layer(s, vec, edge_index, radial_emb, edge_weight, edge_diff, rope, edge_mask)
+
             s = s + ds
             vec = vec + dvec
-            
-            kernel_real = self.kernels_real[id]
-            kernel_imag = self.kernels_imag[id]
-            equation = 'ikl,bi,bl->bk'
-            kerneli = torch.complex(kernel_real, kernel_imag)
-            quantum = torch.einsum(equation, kerneli, s.to(self.complex_type), quantum)
-            quantum = quantum / (self.eps + quantum.abs().to(self.complex_type))
-            
+
+            # new_q[b,k] = sum_{i,l} K[i,k,l] * s[b,i] * q[b,l] with
+            # K = kernels_real[id] + i*kernels_imag[id]: contract s first
+            # (two real GEMMs), then a batched mat-vec in real/imag parts.
+            Mr = torch.matmul(s, self.kernels_real[id].reshape(self.hidden_channels, -1)).view(-1, self.chi1, self.chi1)
+            Mi = torch.matmul(s, self.kernels_imag[id].reshape(self.hidden_channels, -1)).view(-1, self.chi1, self.chi1)
+            nr = torch.bmm(Mr, q_real.unsqueeze(-1)) - torch.bmm(Mi, q_imag.unsqueeze(-1))
+            ni = torch.bmm(Mr, q_imag.unsqueeze(-1)) + torch.bmm(Mi, q_real.unsqueeze(-1))
+            nr = nr.squeeze(-1)
+            ni = ni.squeeze(-1)
+            qnorm = torch.sqrt(nr * nr + ni * ni)
+            q_real = nr / (self.eps + qnorm)
+            q_imag = ni / (self.eps + qnorm)
+
             ds, dvec = fte(s, vec)
             s = s + ds
             vec = vec + dvec
 
-        s = self.last_layer(s) + self.last_layer_quantum(torch.cat([quantum.real, quantum.imag], dim=-1)) / self.chi1
+        s = self.last_layer(s) + self.last_layer_quantum(torch.cat([q_real, q_imag], dim=-1)) / self.chi1
         
         if s.dim() == 2:
             s = (self.a[z].unsqueeze(1) * s + self.b[z].unsqueeze(1))
@@ -549,7 +630,10 @@ class AlphaNet(nn.Module):
             raise ValueError(f"Unexpected shape of s: {s.shape}")
 
         atom_energy = s.squeeze(-1) if s.dim() == 2 and s.size(-1) == 1 else s
-        total_energy = scatter(atom_energy, batch, dim=0, reduce=self.readout).squeeze()
+        # dim_size from natoms metadata (== max(batch)+1) avoids the implicit
+        # index.max() GPU->CPU sync so the step stays CUDA-graph capturable.
+        total_energy = scatter(atom_energy, batch, dim=0,
+                               dim_size=int(data.natoms.numel()), reduce=self.readout).squeeze()
         
         if self.use_sigmoid:
             if return_atom_energy:
