@@ -6,7 +6,8 @@
 
 We present **AlphaNet**, a local frame-based equivariant model designed to tackle the challenges of achieving both accurate and efficient simulations for atomistic systems.  **AlphaNet** enhances computational efficiency and accuracy by leveraging the local geometric structures of atomic environments through the construction of equivariant local frames and learnable frame transitions. And inspired by Quantum Mechanics, AlphaNet **introduces efficient multi-body message passing by using contraction of matrix product states** rather than common 2-body message passing.  Notably, AlphaNet offers one of the best trade-offs between computational efficiency and accuracy among existing models. Moreover, AlphaNet exhibits scalability across a broad spectrum of system and dataset sizes, affirming its versatility.
 
-## News(25.12.29)
+## News(26.7.26)
+We have an accelerated version using triton, see in the **lammps** branch and [the pr](https://github.com/zmyybc/AlphaNet/pull/13). 
 
 If you intend to use AlphaNet in LAMMPS, please switch to the **lammps** branch, we are actively working on merging them into the main branch:
 ```bash
